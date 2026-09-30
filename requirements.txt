@@ -1,7 +1,8 @@
-pandas
-scikit-learn
-requests
-python-dotenv
 fastapi
-pydantic
 uvicorn
+requests
+numpy
+pandas
+python-dotenv
+scikit-learn
+hdbcli

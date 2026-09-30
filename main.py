@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
@@ -11,26 +12,87 @@ load_dotenv()
 app = FastAPI(title="Titanic Fare Prediction API")
 
 
+def load_data_from_hana(host, port, user, password, schema, table):
+    try:
+        from hdbcli import dbapi
+    except ImportError as exc:
+        raise ValueError(
+            "SAP HANA client is missing. Install it with: pip install hdbcli"
+        ) from exc
+
+    quoted_schema = schema.replace('"', '""')
+    quoted_table = table.replace('"', '""')
+    set_schema_query = f'SET SCHEMA "{quoted_schema}"'
+    data_query = f'SELECT * FROM "{quoted_table}"'
+
+    connection = None
+    cursor = None
+    try:
+        connection = dbapi.connect(
+            address=host,
+            port=int(port),
+            user=user,
+            password=password
+        )
+        cursor = connection.cursor()
+        cursor.execute(set_schema_query)
+        cursor.execute(data_query)
+        rows = cursor.fetchall()
+        column_names = [column[0] for column in cursor.description]
+        return pd.DataFrame(rows, columns=column_names)
+    except (ValueError, TypeError):
+        raise
+    except Exception as exc:
+        raise ConnectionError(f"SAP HANA query failed: {exc}") from exc
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if connection is not None:
+            connection.close()
+
+
 def run_prediction():
     # Configuration
-    required = ["AICORE_AUTH_URL", "AICORE_CLIENT_ID", "AICORE_CLIENT_SECRET",
-                "AICORE_API_URL", "TABPFN_DEPLOYMENT_ID"]
+    aicore_required = [
+        "AICORE_AUTH_URL", "AICORE_CLIENT_ID", "AICORE_CLIENT_SECRET",
+        "AICORE_API_URL", "TABPFN_DEPLOYMENT_ID"
+    ]
+    hana_required = [
+        "HANA_HOST", "HANA_PORT", "HANA_USER", "HANA_PASSWORD",
+        "HANA_SCHEMA", "HANA_TABLE"
+    ]
+    required = aicore_required + hana_required
     missing = [key for key in required if not os.getenv(key)]
     if missing:
         raise ValueError(f"Missing environment variables: {', '.join(missing)}")
 
     auth_url, client_id, client_secret, api_url, deployment_id = [
-        os.environ[key] for key in required
+        os.environ[key] for key in aicore_required
     ]
     resource_group = os.getenv("AICORE_RESOURCE_GROUP", "default")
+    hana_host = os.environ["HANA_HOST"]
+    hana_port = os.environ["HANA_PORT"]
+    hana_user = os.environ["HANA_USER"]
+    hana_password = os.environ["HANA_PASSWORD"]
+    hana_schema = os.environ["HANA_SCHEMA"]
+    hana_table = os.environ["HANA_TABLE"]
 
     # Load and clean data
     columns = ["Pclass", "Sex", "Age", "SibSp", "Parch", "Embarked",
                "Name", "Cabin", "Ticket", "Fare"]
-    raw = pd.read_csv("Titanic-Dataset.csv")
-    missing = [column for column in columns if column not in raw.columns]
+    raw = load_data_from_hana(
+        hana_host, hana_port, hana_user, hana_password,
+        hana_schema, hana_table
+    )
+
+    # Match HANA column names without depending on upper/lower case.
+    hana_columns = {str(column).lower(): column for column in raw.columns}
+    missing = [column for column in columns if column.lower() not in hana_columns]
     if missing:
-        raise ValueError(f"Missing CSV columns: {', '.join(missing)}")
+        raise ValueError(f"Missing SAP HANA columns: {', '.join(missing)}")
+    raw = raw.rename(columns={
+        hana_columns[column.lower()]: column for column in columns
+    })
 
     df = raw[columns].copy()
     numeric = ["Pclass", "Age", "SibSp", "Parch", "Fare"]
@@ -161,16 +223,19 @@ def run_prediction():
     }
 
 
+
 @app.post("/predict")
 def predict():
-    """Run the original CSV-based TabPFN regression workflow."""
+    """Load Titanic data from SAP HANA and run TabPFN regression."""
     try:
         return run_prediction()
     except requests.Timeout as exc:
         raise HTTPException(status_code=504, detail="SAP AI Core request timed out.") from exc
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail="SAP AI Core request failed; check server logs.") from exc
-    except (ValueError, FileNotFoundError) as exc:
+    except ConnectionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ValueError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
