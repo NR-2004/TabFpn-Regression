@@ -51,7 +51,7 @@ def load_data_from_hana(host, port, user, password, schema, table):
             connection.close()
 
 
-def run_prediction():
+def run_prediction(include_internal=False):
     # Configuration
     aicore_required = [
         "AICORE_AUTH_URL", "AICORE_CLIENT_ID", "AICORE_CLIENT_SECRET",
@@ -206,8 +206,8 @@ def run_prediction():
         y_train.groupby(X_train["Pclass"]).median()
     ).fillna(y_train.median()).to_numpy(dtype=float)
 
-    # Added for FastAPI: return the existing results as JSON.
-    return {
+    # Public JSON response returned by FastAPI.
+    response_data = {
         "original_rows": len(raw),
         "usable_rows": len(df),
         "training_rows": len(X_train),
@@ -222,7 +222,18 @@ def run_prediction():
         ].head(5).to_dict(orient="records")
     }
 
+    # Model-comparison scripts can request the aligned train/test data.
+    if include_internal:
+        return {
+            "response": response_data,
+            "X_train": X_train,
+            "X_test": X_test,
+            "y_train": y_train,
+            "y_test": y_test,
+            "tabpfn_predictions": predicted
+        }
 
+    return response_data
 
 @app.post("/predict")
 def predict():
